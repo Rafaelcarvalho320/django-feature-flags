@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.10"
+            django: "4.2"
+          - python-version: "3.11"
+            django: "5.0"
+          - python-version: "3.12"
+            django: "5.1"
+          - python-version: "3.12"
+            django: "5.2"
+          - python-version: "3.13"
+            django: "5.2"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+          pip install "Django~=${{ matrix.django }}.0"
+
+      - name: Confirm the Django version under test
+        run: python -c "import django; print(django.get_version())"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Test
+        run: pytest -q
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: mypy
+
+  invariants:
+    # The two properties the rollout is built on, checked outside the suite so
+    # a change to the hashing is a deliberate decision and not an accident
+    # that silently reshuffles every live rollout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      - name: Buckets are stable across processes
+        run: |
+          first=$(python -c "from feature_flags.rollout import bucket_of; print(bucket_of('flag', '1'))")
+          second=$(python -c "from feature_flags.rollout import bucket_of; print(bucket_of('flag', '1'))")
+          echo "two separate interpreters: $first and $second"
+          test "$first" = "$second"
+          test "$first" = "56"
+
+      - name: Raising the percentage never removes a subject
+        run: |
+          python -c "
+          from feature_flags.rollout import in_rollout
+          subjects = [str(n) for n in range(5000)]
+          seen = set()
+          for pct in range(0, 101):
+              now = {s for s in subjects if in_rollout('f', s, pct)}
+              assert seen <= now, f'shrank at {pct}%'
+              seen = now
+          print('monotonic across 0-100% over', len(subjects), 'subjects')
+          "
+
+      - name: Importing the package does not need Django to be set up
+        run: |
+          python -c "
+          import sys, feature_flags
+          assert 'feature_flags.models' not in sys.modules
+          print('lazy import holds, version', feature_flags.__version__)
+          "
+
+      - name: Build the distribution
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
